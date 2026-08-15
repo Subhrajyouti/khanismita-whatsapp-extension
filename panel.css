@@ -1,0 +1,69 @@
+#kr-fab {
+  position: fixed; right: 24px; bottom: 24px; z-index: 2147483000;
+  width: 52px; height: 52px; border-radius: 50%; border: 0; cursor: grab;
+  background: #964B24; color: #fff; font-size: 22px; line-height: 52px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.25); display: flex; align-items: center; justify-content: center;
+  touch-action: none; user-select: none; -webkit-user-select: none;
+  transition: box-shadow .15s ease, background .15s ease;
+}
+#kr-fab:hover { background: #7c3d1d; }
+#kr-fab.kr-dragging {
+  cursor: grabbing; box-shadow: 0 10px 28px rgba(0,0,0,.4); transition: none;
+}
+
+#kr-overlay {
+  position: fixed; inset: 0; z-index: 2147483001;
+  background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+#kr-panel {
+  width: 540px; max-width: 94vw; max-height: 92vh; overflow-y: auto;
+  background: #FCFAF7; color: #2C2523; border-radius: 16px; padding: 24px;
+  box-shadow: 0 16px 48px rgba(0,0,0,.2);
+}
+
+.kr-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+.kr-header h2 { margin: 0; font-size: 20px; font-weight: 700; color: #1C1917; }
+.kr-close-icon { background: none; border: 0; font-size: 20px; cursor: pointer; color: #78716C; }
+
+/* Type Pills (Delivery / Takeaway) */
+.kr-type-pills { display: flex; gap: 6px; background: #F2ECE4; padding: 3px; border-radius: 999px; }
+.kr-pill { border: 0; padding: 6px 14px; font-size: 13px; font-weight: 600; border-radius: 999px; cursor: pointer; background: transparent; color: #78716C; }
+.kr-pill.active { background: #964B24; color: #FFFFFF; }
+
+.kr-field { margin-bottom: 14px; }
+.kr-label { display: block; font-size: 13px; font-weight: 600; color: #44403C; margin-bottom: 6px; }
+.kr-label span { color: #DC2626; }
+
+.kr-input, .kr-textarea {
+  width: 100%; box-sizing: border-box; padding: 10px 14px; font-size: 14px;
+  border-radius: 10px; border: 1px solid #E7E2DA; background: #FAF7F2; color: #1C1917;
+  outline: none; transition: border-color 0.2s;
+}
+.kr-input:focus, .kr-textarea:focus { border-color: #964B24; background: #FFFFFF; }
+.kr-textarea { min-height: 54px; resize: vertical; }
+
+.kr-checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #57534E; margin: -6px 0 14px; }
+.kr-checkbox-row input { accent-color: #964B24; width: 16px; height: 16px; }
+
+/* Items list */
+.kr-item-row { display: grid; grid-template-columns: 1fr 64px 80px 32px; gap: 8px; margin-bottom: 8px; align-items: center; }
+.kr-del-btn { background: #FEE2E2; color: #EF4444; border: 0; border-radius: 8px; height: 38px; cursor: pointer; font-weight: bold; }
+
+.kr-add-btn {
+  background: #F2ECE4; color: #78716C; border: 1px dashed #D6CEC4;
+  width: 100%; padding: 10px; border-radius: 10px; cursor: pointer; font-size: 13px; font-weight: 600; margin-bottom: 14px;
+}
+.kr-add-btn:hover { background: #E7E2DA; }
+
+.kr-send-btn {
+  width: 100%; padding: 12px; border: 0; border-radius: 10px;
+  background: #964B24; color: #FFFFFF; font-size: 15px; font-weight: 700;
+  cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 10px;
+}
+.kr-send-btn:hover { background: #7c3d1d; }
+
+#kr-msg { font-size: 13px; margin-top: 10px; text-align: center; }
+.kr-err { color: #DC2626; }
+.kr-ok { color: #16A34A; }
+.kr-total-bar { text-align: right; font-size: 16px; font-weight: 700; color: #1C1917; margin: 10px 0; }

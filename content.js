@@ -1,0 +1,728 @@
+// WhatsApp Web content script: floating button -> extract chat -> Gemini -> editable order panel.
+
+(function () {
+  if (document.getElementById("kr-fab")) return;
+
+  const send = (type, payload) =>
+    new Promise((res) => chrome.runtime.sendMessage({ type, payload }, res));
+
+  /* ---------------- Phone Extraction via Page Context Injection ---------------- */
+
+  /**
+   * Previously this injected a <script> tag directly — confirmed BROKEN by WhatsApp's
+   * current CSP: "Executing inline script violates CSP directive script-src ...".
+   * The browser refuses to run it at all, silently, every time.
+   *
+   * Fix: ask background.js (which has the "scripting" permission) to run the
+   * extraction via chrome.scripting.executeScript({ world: "MAIN" }) instead. That
+   * API is a browser-native mechanism for running code in the page's own JS context
+   * and is explicitly exempt from the page's CSP — it's not subject to script-src at
+   * all, unlike a DOM-injected <script> tag.
+   *
+   * debug is logged here so we can see, from a REAL main-world execution, whether a
+   * webpack chunk registry exists on this build at all.
+   */
+  async function getPhoneFromInternalStore() {
+    try {
+      const res = await send("EXTRACT_PAGE_JID");
+      if (!res?.ok) {
+        console.warn("[KR] EXTRACT_PAGE_JID failed:", res?.error);
+        return "";
+      }
+      const { phone, debug } = res.data || {};
+      console.log("[KR] MAIN-world extraction debug:", debug);
+      return phone || "";
+    } catch (e) {
+      console.warn("[KR] EXTRACT_PAGE_JID threw:", e);
+      return "";
+    }
+  }
+
+  /**
+   * extractChat() calls getPhoneFromInternalStore() once. On a freshly-opened chat
+   * #main may still be re-rendering when we inject, so give it one retry after a
+   * short delay before falling through to DOM heuristics.
+   */
+  async function getPhoneFromInternalStoreWithRetry() {
+    let phone = await getPhoneFromInternalStore();
+    if (!phone) {
+      await new Promise((r) => setTimeout(r, 350));
+      phone = await getPhoneFromInternalStore();
+    }
+    return phone;
+  }
+
+  /* ---------------- Helper Utilities ---------------- */
+
+  /**
+   * BUG FIX: the old regex `/(?:\+91[\s-]?)?[6-9]\d{9}/` matched greedily against
+   * concatenated digit runs like a WhatsApp JID "919876543210@c.us" — it would grab
+   * "9198765432" (country code + first 8 digits of the real number) starting at
+   * position 0, instead of the actual number "9876543210" one digit later, because
+   * regex doesn't backtrack once an earlier match succeeds. Adding digit-boundary
+   * lookaround (?<!\d) / (?!\d) means a match can't start or end in the middle of a
+   * longer digit run, so it now correctly refuses to match inside a JID at all (use
+   * extractPhoneFromJid for those) and only matches genuine standalone numbers typed
+   * in message text, e.g. "call me on 9876543210" or "+91 98765 43210".
+   */
+  function extractPhoneFromText(text) {
+    if (!text) return "";
+    const cleaned = text.replace(/[\s-]/g, (m, offset, str) => {
+      // collapse spaces/dashes ONLY when they sit between digits (so "98765 43210"
+      // still matches as one number), but don't touch surrounding punctuation.
+      const before = str[offset - 1], after = str[offset + 1];
+      return /\d/.test(before) && /\d/.test(after) ? "" : m;
+    });
+    const matches = cleaned.match(/(?<!\d)(?:\+?91)?[6-9]\d{9}(?!\d)/g);
+    if (matches && matches.length > 0) {
+      return matches[matches.length - 1].replace(/\D/g, "").slice(-10);
+    }
+    return "";
+  }
+
+  /**
+   * PRIMARY phone source: WhatsApp message elements carry a `data-id` attribute of
+   * the form `{fromMe}_{jid}_{messageId}` (individual chats) or
+   * `{fromMe}_{groupJid}_{messageId}_{participantJid}` (group chats). The jid is
+   * always phone-number-based ("<digits>@c.us" or "@s.whatsapp.net") *regardless* of
+   * whether the contact is saved in the phonebook — saved-name display is a UI-layer
+   * concern only, it doesn't change the underlying id. This needs no store/fiber
+   * access at all, so it's tried first.
+   *
+   * Caveat: WhatsApp has been migrating some identifiers to privacy-preserving
+   * "@lid" (linked ID) values that are NOT phone numbers and can't be reversed
+   * client-side. If every data-id on a chat ends in @lid instead of @c.us, the real
+   * phone number isn't recoverable from the DOM or client state at all — flagged via
+   * the returned `isLid` so the UI can tell the user to type it in manually instead
+   * of silently showing a blank/wrong field.
+   */
+  const PHONE_RE = /^(?:91)?([6-9]\d{9})$/;
+  function validatePhone(raw) {
+    if (!raw) return "";
+    const digits = String(raw).replace(/\D/g, "");
+    const m = digits.match(PHONE_RE);
+    return m ? m[1] : "";
+  }
+
+  function extractPhoneFromJid(raw) {
+    if (!raw) return { phone: "", isLid: false };
+    const str = String(raw);
+    // Prefer the LAST @c.us/@s.whatsapp.net match: for incoming group messages the
+    // real sender's jid is appended after the group's own jid.
+    const waMatches = [...str.matchAll(/(\d{5,15})@(?:c\.us|s\.whatsapp\.net)/g)];
+    if (waMatches.length) {
+      const validated = validatePhone(waMatches[waMatches.length - 1][1]);
+      if (validated) return { phone: validated, isLid: false };
+    }
+    if (/@lid/.test(str)) return { phone: "", isLid: true };
+    return { phone: "", isLid: false };
+  }
+
+  function parseStamp(pre) {
+    if (!pre) return null;
+    const m = pre.match(/\[([^\]]+)\]\s*([^:]*):/);
+    if (!m) return null;
+    const [, stamp, author] = m;
+    const parts = stamp.split(",").map((s) => s.trim());
+    if (parts.length < 1) return { date: null, author };
+
+    const timeRaw = parts[0];
+    const ampm = /(am|pm)/i.exec(timeRaw)?.[1]?.toLowerCase();
+    let [hh, mm] = timeRaw.replace(/\s*(am|pm)/i, "").split(":").map(Number);
+    if (ampm === "pm" && hh < 12) hh += 12;
+    if (ampm === "am" && hh === 12) hh = 0;
+
+    const now = new Date();
+    let date = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hh || 0, mm || 0);
+
+    if (parts.length >= 2) {
+      const d = parts[1].split("/").map(Number);
+      if (d.length === 3) {
+        let [a, b, y] = d;
+        if (y < 100) y += 2000;
+        let day = a, month = b;
+        if (a > 12) { day = a; month = b; } else if (b > 12) { day = b; month = a; }
+        date = new Date(y, month - 1, day, hh || 0, mm || 0);
+      }
+    }
+    return { date: isNaN(date.getTime()) ? null : date, author };
+  }
+
+  /**
+   * Inspects DOM elements (attributes, header info, image elements) for contact details.
+   * Logs each stage with a "[KR]" prefix so you can open DevTools → Console on the
+   * web.whatsapp.com tab, click the 🍛 button, and see exactly where it succeeds/fails.
+   */
+  function inspectDOMForContact() {
+    const main = document.querySelector("#main");
+    if (!main) {
+      console.log("[KR] inspectDOMForContact: #main not found");
+      return { name: "", phone: "", isLid: false };
+    }
+
+    const header = main.querySelector("header");
+    let name = "";
+    let phone = "";
+    let isLid = false;
+
+    if (header) {
+      const titleEl = header.querySelector("span[title], span[dir='auto'], div[role='button'] span");
+      name = titleEl?.getAttribute("title") || titleEl?.innerText?.trim() || "";
+
+      const imgEl = header.querySelector("img");
+      if (!name && imgEl && imgEl.alt) {
+        name = imgEl.alt.replace(/avatar/i, "").trim();
+      }
+    }
+    console.log("[KR] header name:", name || "(none)");
+
+    // Primary: scan every message node's data-id for a real JID. This does not
+    // depend on saved/unsaved contact status, page-context injection, or webpack —
+    // it's a plain DOM attribute read.
+    const msgNodes = main.querySelectorAll("[data-id]");
+    console.log("[KR] message nodes with data-id found:", msgNodes.length);
+    let sampleLogged = false;
+    for (const node of msgNodes) {
+      const dataId = node.getAttribute("data-id") || "";
+      if (!sampleLogged && dataId) {
+        console.log("[KR] sample data-id:", dataId);
+        sampleLogged = true;
+      }
+      const result = extractPhoneFromJid(dataId);
+      if (result.phone) {
+        phone = result.phone;
+        console.log("[KR] phone found via data-id:", phone);
+        break;
+      }
+      if (result.isLid) isLid = true;
+    }
+
+    // Fallback: data-pre-plain-text / free-text scans (header subtext, message body)
+    // — only useful for UNSAVED contacts where WhatsApp shows the raw number as the
+    // display name/author, but cheap to try.
+    if (!phone) {
+      const subtextSpan = header?.querySelector("span[dir='ltr']");
+      if (subtextSpan) phone = extractPhoneFromText(subtextSpan.innerText);
+      if (!phone) phone = extractPhoneFromText(name);
+    }
+    if (!phone) {
+      for (const node of main.querySelectorAll("[data-pre-plain-text]")) {
+        const found = extractPhoneFromText(node.getAttribute("data-pre-plain-text") || "");
+        if (found) { phone = found; break; }
+      }
+    }
+
+    if (!phone && isLid) {
+      console.warn(
+        "[KR] Only @lid (privacy) identifiers found for this chat — WhatsApp is not exposing a " +
+        "phone-based JID anywhere in the DOM for it, so this can't be recovered automatically. " +
+        "Type the number in manually."
+      );
+    }
+    if (!phone && !isLid) {
+      console.warn("[KR] No phone found via DOM. Will try page-context injection next.");
+    }
+
+    return { name, phone, isLid };
+  }
+
+  async function extractChat(minutes) {
+    const main = document.querySelector("#main");
+    if (!main) return { transcript: "", count: 0, title: "", detectedPhone: "", isLid: false };
+
+    // 1. DOM data-id JID scan first — synchronous, no page-context injection needed,
+    //    and works regardless of saved/unsaved contact status. This is the primary,
+    //    reliable path (see inspectDOMForContact for why).
+    const domContact = inspectDOMForContact();
+    const title = domContact.name || main.querySelector("header span[title]")?.getAttribute("title") || "";
+    let detectedPhone = domContact.phone;
+    let isLid = domContact.isLid;
+
+    // 2. Only fall back to page-context injection (webpack/fiber internals) if the
+    //    DOM scan found nothing AND it wasn't because of an @lid privacy id — in the
+    //    @lid case the number genuinely isn't present client-side and injection
+    //    won't find it either, so skip the extra work and 600ms timeout.
+    if (!detectedPhone && !isLid) {
+      console.log("[KR] DOM scan empty, trying page-context injection…");
+      detectedPhone = await getPhoneFromInternalStoreWithRetry();
+      if (detectedPhone) console.log("[KR] phone found via page-context injection:", detectedPhone);
+      else console.warn("[KR] page-context injection also found nothing for this chat.");
+    }
+
+    if (!detectedPhone) detectedPhone = extractPhoneFromText(title);
+
+    const rows = [...main.querySelectorAll("div.message-in, div.message-out, div[role='row']")];
+
+    // Raw diagnostic dump — run once regardless of whether phone was already found,
+    // so we can see WhatsApp's CURRENT markup directly instead of guessing against
+    // remembered structure. This is the fastest way to pinpoint what changed.
+    console.log("[KR] === DOM DIAGNOSTIC ===");
+    console.log("[KR] [data-id] anywhere in #main:", main.querySelectorAll("[data-id]").length);
+    console.log("[KR] div.message-in:", main.querySelectorAll("div.message-in").length,
+                "| div.message-out:", main.querySelectorAll("div.message-out").length,
+                "| div[role='row']:", main.querySelectorAll("div[role='row']").length);
+    console.log("[KR] tail-in:", main.querySelectorAll('[data-testid="tail-in"]').length,
+                "| tail-out:", main.querySelectorAll('[data-testid="tail-out"]').length,
+                "| [data-pre-plain-text]:", main.querySelectorAll("[data-pre-plain-text]").length);
+    if (rows.length) {
+      const sample = rows[rows.length - 1];
+      console.log("[KR] last row outerHTML (truncated 1000 chars):", sample.outerHTML.slice(0, 1000));
+      console.log("[KR] last row's own attributes:", [...sample.attributes].map(a => `${a.name}="${a.value}"`).join(" | "));
+      let anc = sample.parentElement;
+      for (let i = 0; i < 3 && anc; i++) {
+        console.log(`[KR] ancestor ${i + 1} (${anc.tagName}) attributes:`, [...anc.attributes].map(a => `${a.name}="${a.value}"`).join(" | "));
+        anc = anc.parentElement;
+      }
+    } else {
+      console.log("[KR] No message rows matched any selector at all.");
+    }
+
+    // Header dump — does the phone number show up as visible text anywhere near the
+    // contact name (tooltip title, aria-label, subtitle span)?
+    const headerEl = main.querySelector("header");
+    if (headerEl) {
+      console.log("[KR] header outerHTML (truncated 1500 chars):", headerEl.outerHTML.slice(0, 1500));
+    } else {
+      console.log("[KR] No <header> found under #main.");
+    }
+
+    // Bundler fingerprint — figure out what module system this build actually uses,
+    // since the StyleX atomic classes suggest this isn't the plain-webpack build the
+    // earlier injection script assumed.
+    const bundlerKeys = Object.keys(window).filter(k =>
+      /^webpackChunk|^__d$|^require$|requireLazy|__webpack|WAWebCmd|__META/i.test(k)
+    );
+    console.log("[KR] window keys matching known bundler patterns:", bundlerKeys.length ? bundlerKeys : "(none found)");
+
+    console.log("[KR] === END DIAGNOSTIC ===");
+
+    const cutoff = Date.now() - minutes * 60 * 1000;
+    const out = [];
+
+    for (const row of rows) {
+      const pre = row.querySelector("[data-pre-plain-text]")?.getAttribute("data-pre-plain-text") || "";
+      const info = pre ? parseStamp(pre) : null;
+      if (info?.date && info.date.getTime() < cutoff) continue;
+
+      const textEl =
+        row.querySelector("span.selectable-text") ||
+        row.querySelector("span._ao3e") ||
+        row.querySelector("div.copyable-text") ||
+        row.querySelector("span[dir='ltr']");
+
+      const text = textEl?.innerText?.trim() || "";
+      const link = [...row.querySelectorAll("a")].map((a) => a.href).find((h) => /maps|goo\.gl/.test(h));
+
+      if (!detectedPhone) {
+        detectedPhone = extractPhoneFromText(text);
+      }
+
+      // FIXED: "div.message-out" no longer exists on the current build (confirmed via
+      // diagnostic: 0 matches). WhatsApp now marks outgoing messages with
+      // data-testid="tail-out" (incoming = "tail-in") on the little bubble-tail
+      // graphic. Keep the old class check too as a harmless fallback for older builds.
+      const isOut =
+        !!row.querySelector('[data-testid="tail-out"]') ||
+        row.classList.contains("message-out") ||
+        !!row.querySelector("div.message-out");
+      const who = isOut ? "Restaurant" : (info?.author || "Customer");
+      const body = [text, link].filter(Boolean).join(" ");
+      if (body) out.push(`${who}: ${body}`);
+    }
+
+    const tail = out.slice(-60);
+    console.log("[KR] final detectedPhone:", detectedPhone || "(none)", "| isLid:", isLid);
+    return { transcript: tail.join("\n"), count: tail.length, title, detectedPhone, isLid };
+  }
+
+  function parseCoords(input) {
+    if (!input) return null;
+    const pats = [
+      /[?&]q=(?:loc:)?(-?\d+\.\d+),\s*(-?\d+\.\d+)/i,
+      /[?&]ll=(-?\d+\.\d+),\s*(-?\d+\.\d+)/i,
+      /@(-?\d+\.\d+),(-?\d+\.\d+)/,
+      /!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/,
+      /(-?\d+\.\d+),\s*(-?\d+\.\d+)/,
+    ];
+    for (const re of pats) {
+      const m = input.match(re);
+      if (m) {
+        const lat = parseFloat(m[1]), lng = parseFloat(m[2]);
+        if (Math.abs(lat) <= 90 && Math.abs(lng) <= 180) return { lat, lng };
+      }
+    }
+    return null;
+  }
+
+  /* ---------------- UI ---------------- */
+
+  const fab = document.createElement("button");
+  fab.id = "kr-fab";
+  fab.innerHTML = "🍛";
+  fab.title = "Create Kitchen Order — drag to move";
+  document.body.appendChild(fab);
+
+  /* ---- Draggable FAB ----
+   * Pointer Events cover mouse + touch in one API. A press only counts as a "drag"
+   * once movement crosses DRAG_THRESHOLD px — below that it's treated as a normal
+   * click so the panel still opens on a simple tap. Position is clamped to stay
+   * fully on-screen (including on window resize) and persisted in
+   * chrome.storage.local so it's remembered next time the page loads.
+   */
+  const FAB_POS_KEY = "krFabPos";
+  const DRAG_THRESHOLD = 6;
+
+  function clampFabPosition(left, top) {
+    const margin = 4;
+    const w = fab.offsetWidth || 52;
+    const h = fab.offsetHeight || 52;
+    const maxLeft = Math.max(margin, window.innerWidth - w - margin);
+    const maxTop = Math.max(margin, window.innerHeight - h - margin);
+    return { left: Math.min(Math.max(left, margin), maxLeft), top: Math.min(Math.max(top, margin), maxTop) };
+  }
+
+  function applyFabPosition(left, top) {
+    fab.style.left = `${left}px`;
+    fab.style.top = `${top}px`;
+    fab.style.right = "auto";
+    fab.style.bottom = "auto";
+  }
+
+  chrome.storage.local.get({ [FAB_POS_KEY]: null }, (res) => {
+    const pos = res[FAB_POS_KEY];
+    if (pos && typeof pos.left === "number" && typeof pos.top === "number") {
+      const c = clampFabPosition(pos.left, pos.top);
+      applyFabPosition(c.left, c.top);
+    }
+  });
+
+  let dragState = null;
+  let didDrag = false;
+  let suppressNextClick = false;
+
+  fab.addEventListener("pointerdown", (e) => {
+    if (e.button !== undefined && e.button !== 0) return; // primary button/touch only
+    const rect = fab.getBoundingClientRect();
+    dragState = { startX: e.clientX, startY: e.clientY, origLeft: rect.left, origTop: rect.top };
+    didDrag = false;
+    fab.setPointerCapture(e.pointerId);
+  });
+
+  fab.addEventListener("pointermove", (e) => {
+    if (!dragState) return;
+    const dx = e.clientX - dragState.startX;
+    const dy = e.clientY - dragState.startY;
+    if (!didDrag && Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
+    didDrag = true;
+    fab.classList.add("kr-dragging");
+    const c = clampFabPosition(dragState.origLeft + dx, dragState.origTop + dy);
+    applyFabPosition(c.left, c.top);
+  });
+
+  function endDrag(e) {
+    if (!dragState) return;
+    try { fab.releasePointerCapture(e.pointerId); } catch (_) {}
+    fab.classList.remove("kr-dragging");
+    if (didDrag) {
+      // A "click" event still fires after pointerup even though the pointer moved
+      // (setPointerCapture routes it to the fab regardless of where it's released) —
+      // suppress just that one synthetic click so dropping the button doesn't also
+      // pop the order panel open.
+      suppressNextClick = true;
+      const rect = fab.getBoundingClientRect();
+      chrome.storage.local.set({ [FAB_POS_KEY]: { left: rect.left, top: rect.top } });
+    }
+    dragState = null;
+  }
+  fab.addEventListener("pointerup", endDrag);
+  fab.addEventListener("pointercancel", endDrag);
+
+  window.addEventListener("resize", () => {
+    if (fab.style.left && fab.style.top) {
+      const c = clampFabPosition(parseFloat(fab.style.left), parseFloat(fab.style.top));
+      applyFabPosition(c.left, c.top);
+    }
+  });
+
+  let menuCache = null;
+
+  fab.addEventListener("click", async (e) => {
+    if (suppressNextClick) {
+      suppressNextClick = false;
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    const cfgRes = await send("GET_CONFIG");
+    const minutes = cfgRes?.data?.lookback || 20;
+    const chat = await extractChat(minutes);
+
+    if (!chat.transcript) {
+      alert("Open a chat first — no messages found in the last " + minutes + " minutes.");
+      return;
+    }
+
+    openPanel({ loading: true });
+
+    try {
+      if (!menuCache) {
+        const m = await send("GET_MENU");
+        if (!m?.ok) throw new Error(m?.error || "Menu fetch failed");
+        menuCache = m.data;
+      }
+
+      const p = await send("PARSE_CHAT", { transcript: chat.transcript, menu: menuCache });
+      if (!p?.ok) throw new Error(p?.error || "AI parse failed");
+
+      const draft = p.data || {};
+      draft.customer_phone = draft.customer_phone || chat.detectedPhone || "";
+      draft.customer_name = draft.customer_name || (/\d/.test(chat.title) ? "" : chat.title);
+
+      let parsed = parseCoords(draft.location_text);
+      if (!parsed && draft.location_lat && draft.location_lng) {
+        parsed = { lat: draft.location_lat, lng: draft.location_lng };
+      }
+
+      if (parsed) {
+        draft.location_text = `${parsed.lat}, ${parsed.lng}`;
+      }
+
+      openPanel({ draft, meta: chat });
+    } catch (e) {
+      openPanel({ error: String(e.message || e) });
+    }
+  });
+
+  function closePanel() {
+    document.getElementById("kr-overlay")?.remove();
+  }
+
+  function openPanel({ draft, loading, error, meta }) {
+    closePanel();
+    const overlay = document.createElement("div");
+    overlay.id = "kr-overlay";
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) closePanel(); });
+
+    const panel = document.createElement("div");
+    panel.id = "kr-panel";
+    overlay.appendChild(panel);
+    document.body.appendChild(overlay);
+
+    if (loading) {
+      panel.innerHTML = `<h2 style="font-size:16px;">Reading chat with Gemini…</h2><div style="font-size:13px; color:#78716C; margin-top:6px;">Extracting items and customer details...</div>`;
+      return;
+    }
+    if (error) {
+      panel.innerHTML = `<h2 style="font-size:16px; color:#DC2626;">Something went wrong</h2><div style="font-size:13px; color:#78716C; margin-top:6px;">${error}</div>
+        <button class="kr-add-btn" id="kr-close" style="margin-top:16px;">Close</button>`;
+      panel.querySelector("#kr-close").onclick = closePanel;
+      return;
+    }
+
+    const d = draft || {};
+    const hasCallNum = Boolean(d.call_number);
+    let orderType = d.order_type || "delivery";
+    const items = (d.items || []).map((i) => ({
+      item_name: i.item_name || "",
+      quantity: Number(i.quantity) || 1,
+      unit_price: Number(i.unit_price) || 0,
+    }));
+
+    panel.innerHTML = `
+      <div class="kr-header">
+        <h2>New Order</h2>
+        <div style="display:flex; align-items:center; gap:12px;">
+          <div class="kr-type-pills">
+            <button class="kr-pill ${orderType === 'delivery' ? 'active' : ''}" id="kr-pill-delivery">🛵 Delivery</button>
+            <button class="kr-pill ${orderType === 'takeaway' ? 'active' : ''}" id="kr-pill-takeaway">🛍️ Takeaway</button>
+          </div>
+          <button class="kr-close-icon" id="kr-close-x">✕</button>
+        </div>
+      </div>
+
+      <div class="kr-field">
+        <label class="kr-label">Phone <span>*</span></label>
+        <input class="kr-input" id="kr-phone" placeholder="${meta?.isLid && !d.customer_phone ? "Not auto-detectable for this chat — enter manually" : "10-digit number"}" value="${esc((d.customer_phone || "").replace(/\D/g, "").slice(-10))}">
+        ${meta?.isLid && !d.customer_phone ? `<div style="font-size:12px; color:#B45309; margin-top:4px;">WhatsApp is using a privacy ID for this chat, so the number can't be pulled automatically — ask the customer or check your phone's WhatsApp app.</div>` : ""}
+      </div>
+
+      <div class="kr-checkbox-row">
+        <input type="checkbox" id="kr-diff-call-cb" ${hasCallNum ? 'checked' : ''}>
+        <label for="kr-diff-call-cb" style="cursor:pointer;">Different call number</label>
+      </div>
+
+      <div class="kr-field" id="kr-call-box" style="display:${hasCallNum ? 'block' : 'none'};">
+        <label class="kr-label">Call number</label>
+        <input class="kr-input" id="kr-call" placeholder="Call phone number" value="${esc(d.call_number || '')}">
+      </div>
+
+      <div class="kr-field">
+        <label class="kr-label">Name</label>
+        <input class="kr-input" id="kr-name" placeholder="Customer name" value="${esc(d.customer_name)}">
+      </div>
+
+      <div class="kr-field">
+        <label class="kr-label">Location</label>
+        <input class="kr-input" id="kr-loc" placeholder="lat,lng (paste from Maps)" value="${esc(d.location_text)}">
+      </div>
+
+      <div class="kr-field">
+        <input class="kr-input" id="kr-address-text" placeholder="Address (text — shown to rider)" value="${esc(d.rider_notes || d.location_text || '')}">
+      </div>
+
+      <div class="kr-field">
+        <label class="kr-label">Delivery fee (₹)</label>
+        <input class="kr-input" type="number" id="kr-fee" value="${Number(d.delivery_fee) || 0}">
+      </div>
+
+      <div class="kr-field">
+        <label class="kr-label">Items <span>*</span></label>
+        <div id="kr-items"></div>
+        <button class="kr-add-btn" id="kr-additem">+ Add item</button>
+      </div>
+
+      <div class="kr-field">
+        <textarea class="kr-textarea" id="kr-notes" placeholder="Kitchen note (optional)">${esc(d.notes)}</textarea>
+      </div>
+
+      <div class="kr-field">
+        <textarea class="kr-textarea" id="kr-rnotes" placeholder="Rider note (optional, only rider sees this)">${esc(d.rider_notes)}</textarea>
+      </div>
+
+      <div class="kr-total-bar">Total: ₹<span id="kr-total">0.00</span></div>
+      <div id="kr-msg"></div>
+
+      <button class="kr-send-btn" id="kr-send">
+        <span>✈</span> Send to Kitchen
+      </button>
+    `;
+
+    const deliveryPill = panel.querySelector("#kr-pill-delivery");
+    const takeawayPill = panel.querySelector("#kr-pill-takeaway");
+    deliveryPill.onclick = () => {
+      orderType = "delivery";
+      deliveryPill.classList.add("active");
+      takeawayPill.classList.remove("active");
+    };
+    takeawayPill.onclick = () => {
+      orderType = "takeaway";
+      takeawayPill.classList.add("active");
+      deliveryPill.classList.remove("active");
+    };
+
+    const diffCb = panel.querySelector("#kr-diff-call-cb");
+    const callBox = panel.querySelector("#kr-call-box");
+    diffCb.onchange = () => { callBox.style.display = diffCb.checked ? "block" : "none"; };
+
+    panel.querySelector("#kr-close-x").onclick = closePanel;
+
+    const itemsBox = panel.querySelector("#kr-items");
+
+    function renderItems() {
+      itemsBox.innerHTML = "";
+      items.forEach((it, idx) => {
+        const row = document.createElement("div");
+        row.className = "kr-item-row";
+        row.innerHTML = `
+          <input class="kr-input" value="${esc(it.item_name)}" data-f="item_name" placeholder="Search menu item..." list="kr-menu">
+          <input class="kr-input" type="number" min="1" value="${it.quantity}" data-f="quantity">
+          <input class="kr-input" type="number" min="0" value="${it.unit_price}" data-f="unit_price">
+          <button class="kr-del-btn" title="Remove">✕</button>`;
+
+        row.querySelectorAll("input").forEach((inp) => {
+          inp.addEventListener("input", () => {
+            const f = inp.dataset.f;
+            items[idx][f] = f === "item_name" ? inp.value : Number(inp.value) || 0;
+            if (f === "item_name") {
+              const hit = (menuCache || []).find((m) => m.name.toLowerCase() === inp.value.toLowerCase());
+              if (hit) {
+                items[idx].unit_price = Number(hit.price) || 0;
+                const unitPriceInput = row.querySelector('[data-f="unit_price"]');
+                if (unitPriceInput) unitPriceInput.value = items[idx].unit_price;
+              }
+            }
+            calcTotal();
+          });
+        });
+        row.querySelector("button").onclick = () => { items.splice(idx, 1); renderItems(); calcTotal(); };
+        itemsBox.appendChild(row);
+      });
+
+      if (!panel.querySelector("#kr-menu")) {
+        const dl = document.createElement("datalist");
+        dl.id = "kr-menu";
+        (menuCache || []).forEach((m) => {
+          const o = document.createElement("option");
+          o.value = m.name;
+          dl.appendChild(o);
+        });
+        panel.appendChild(dl);
+      }
+    }
+
+    function calcTotal() {
+      const sub = items.reduce((s, i) => s + i.quantity * i.unit_price, 0);
+      const fee = Number(panel.querySelector("#kr-fee").value) || 0;
+      const t = Math.max(0, sub + fee);
+      panel.querySelector("#kr-total").textContent = t.toFixed(2);
+      return t;
+    }
+
+    renderItems();
+    calcTotal();
+
+    panel.querySelector("#kr-additem").onclick = () => {
+      items.push({ item_name: "", quantity: 1, unit_price: 0 });
+      renderItems();
+    };
+
+    panel.querySelector("#kr-fee").addEventListener("input", calcTotal);
+
+    panel.querySelector("#kr-send").onclick = async (ev) => {
+      const btn = ev.currentTarget;
+      const msg = panel.querySelector("#kr-msg");
+      const phone = panel.querySelector("#kr-phone").value.replace(/\D/g, "").slice(-10);
+
+      if (phone.length !== 10) { msg.className = "kr-err"; msg.textContent = "Please enter a valid 10-digit phone number."; return; }
+      if (!items.length) { msg.className = "kr-err"; msg.textContent = "Add at least one menu item."; return; }
+
+      btn.disabled = true; btn.innerHTML = "Sending to Kitchen…";
+      msg.className = ""; msg.textContent = "";
+
+      const locInput = panel.querySelector("#kr-loc").value.trim();
+      const coords = parseCoords(locInput);
+
+      const payload = {
+        customer_phone: phone,
+        customer_name: panel.querySelector("#kr-name").value.trim() || "WhatsApp Customer",
+        call_number: diffCb.checked ? (panel.querySelector("#kr-call").value.trim() || null) : null,
+        location_text: locInput || null,
+        location_lat: coords?.lat || null,
+        location_lng: coords?.lng || null,
+        notes: panel.querySelector("#kr-notes").value.trim() || null,
+        rider_notes: panel.querySelector("#kr-address-text").value.trim() || panel.querySelector("#kr-rnotes").value.trim() || null,
+        order_type: orderType,
+        delivery_fee_charged: Number(panel.querySelector("#kr-fee").value) || 0,
+        total_amount: calcTotal(),
+        status: "pending",
+        items,
+      };
+
+      const res = await send("CREATE_ORDER", payload);
+      if (res?.ok) {
+        msg.className = "kr-ok";
+        msg.textContent = `Order sent to kitchen ✓`;
+        btn.innerHTML = "Sent ✓";
+        setTimeout(closePanel, 1200);
+      } else {
+        msg.className = "kr-err";
+        msg.textContent = res?.error || "Failed to create order.";
+        btn.disabled = false; btn.innerHTML = "✈ Send to Kitchen";
+      }
+    };
+  }
+
+  function esc(v) {
+    return String(v ?? "").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+  }
+})();

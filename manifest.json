@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Khanismita Order Extractor",
+  "version": "1.0.0",
+  "description": "Extract WhatsApp Web chats with Gemini AI and create kitchen orders in one click.",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": [
+    "https://web.whatsapp.com/*",
+    "https://generativelanguage.googleapis.com/*",
+    "https://opcnbtnoefrchzdaabbt.supabase.co/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "options.html", "default_icon": "icon.png" },
+  "options_page": "options.html",
+  "icons": { "48": "icon.png", "128": "icon.png" },
+  "content_scripts": [
+    {
+      "matches": ["https://web.whatsapp.com/*"],
+      "js": ["content.js"],
+      "css": ["panel.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
