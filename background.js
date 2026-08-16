@@ -205,6 +205,48 @@ function mainWorldExtractJid() {
     return validatePhone(raw);
   }
 
+  // Shared extraction: given a "chat"-shaped object (from either the store or a
+  // fiber walk), pull BOTH a validated phone and a human display name out of it in
+  // one pass. The name check rejects candidates that are themselves just a phone
+  // number string (so a chat with no real pushname doesn't come back with the
+  // number duplicated into the name field).
+  const NAME_LOOKS_LIKE_PHONE = /^\+?[\d\s-]{8,}$/;
+  function extractContactFields(chatObj) {
+    if (!chatObj) return { phone: "", name: "" };
+
+    const idCandidates = [chatObj.id, chatObj.contact?.id, chatObj.__x_contact?.id];
+    let phone = "";
+    for (const idVal of idCandidates) {
+      const v = jidToPhone(idVal);
+      if (v) { phone = v; break; }
+    }
+    if (!phone) {
+      phone = validatePhone(chatObj.contact?.phoneNumber) || validatePhone(chatObj.__x_contact?.phoneNumber);
+    }
+
+    // pushname/pushName is WhatsApp's term for the self-set display name a contact
+    // shows even when you haven't saved them — exactly the "~Seema" shown in the
+    // Contact Info panel. Checked first, ahead of any locally-saved name field,
+    // since the DOM scan already handles the saved-name case just fine on its own.
+    const nameCandidates = [
+      chatObj.contact?.pushname,
+      chatObj.contact?.pushName,
+      chatObj.__x_contact?.pushname,
+      chatObj.contact?.verifiedName,
+      chatObj.formattedTitle,
+      chatObj.contact?.name,
+      chatObj.contact?.shortName,
+    ];
+    let name = "";
+    for (const n of nameCandidates) {
+      if (typeof n === "string" && n.trim() && !NAME_LOOKS_LIKE_PHONE.test(n.trim())) {
+        name = n.trim();
+        break;
+      }
+    }
+    return { phone, name };
+  }
+
   function findStoreViaWebpack() {
     try {
       const chunkNames = Object.keys(window).filter((k) => /^webpackChunk/i.test(k));
@@ -235,12 +277,11 @@ function mainWorldExtractJid() {
     return null;
   }
 
-  // Instead of trusting the FIRST "chat"-shaped object's .id blindly, check several
-  // plausible candidate fields (top-level id, nested contact id, an explicit
-  // phoneNumber field some models keep even when addressed via lid) and only accept
-  // one that actually validates. Every candidate seen (up to 4) gets previewed into
-  // debug.candidatesSeen so we have full visibility even when nothing validates.
-  function fiberWalkForChatJid() {
+  // Walks the fiber tree collecting BOTH fields from every "chat"-shaped object
+  // encountered, filling in whichever of phone/name is still missing as it goes,
+  // and returning early only once both are found (or the walk runs out). Every
+  // candidate seen (up to 4) gets a safe preview logged for visibility.
+  function fiberWalkForChatFields() {
     const roots = [
       document.querySelector("#main"),
       document.querySelector("#app"),
@@ -248,6 +289,7 @@ function mainWorldExtractJid() {
     ].filter(Boolean);
     debug.rootsFound = roots.length;
     debug.candidatesSeen = [];
+    const result = { phone: "", name: "" };
 
     for (const el of roots) {
       const key = Object.keys(el).find(
@@ -261,44 +303,47 @@ function mainWorldExtractJid() {
         const props = curr.memoizedProps || curr.pendingProps;
         const state = curr.memoizedState;
         const chat = props?.chat || props?.channel || props?.activeChat || state?.chat || state?.element?.chat;
-        if (chat?.id) {
-          const candidates = [
-            ["chat.id", chat.id],
-            ["chat.contact.id", chat.contact?.id],
-            ["chat.contact.phoneNumber", chat.contact?.phoneNumber],
-            ["chat.__x_contact.id", chat.__x_contact?.id],
-          ];
-          for (const [path, val] of candidates) {
-            if (val == null) continue;
-            const validated = jidToPhone(val);
-            if (validated) return validated;
-          }
+        if (chat?.id || chat?.contact) {
+          const r = extractContactFields(chat);
+          if (r.phone && !result.phone) result.phone = r.phone;
+          if (r.name && !result.name) result.name = r.name;
           if (debug.candidatesSeen.length < 4) {
-            debug.candidatesSeen.push({ path: "chat", preview: safePreview(chat.id, 1), server: chat.id?.server });
+            debug.candidatesSeen.push({
+              preview: safePreview(chat.contact || chat.id, 1),
+              server: chat.id?.server,
+            });
           }
+          if (result.phone && result.name) return result;
         }
         curr = curr.return;
         hops++;
       }
       debug.hopsWalked = hops;
     }
-    return "";
+    return result;
   }
 
   let phone = "";
+  let pushName = "";
   try {
     const chatModel = findStoreViaWebpack();
     debug.chatModelFound = !!chatModel;
     const active = chatModel?.active?.() || chatModel?.getActive?.() || chatModel?.models?.find?.((c) => c.active);
     debug.activeFound = !!active;
-    if (active?.id) phone = jidToPhone(active.id);
+    if (active) {
+      const r = extractContactFields(active);
+      phone = r.phone;
+      pushName = r.name;
+    }
   } catch (e) {
     debug.storeError = String(e);
   }
 
-  if (!phone) {
+  if (!phone || !pushName) {
     try {
-      phone = fiberWalkForChatJid();
+      const r = fiberWalkForChatFields();
+      if (!phone) phone = r.phone;
+      if (!pushName) pushName = r.name;
     } catch (e) {
       debug.fiberError = String(e);
     }
@@ -308,7 +353,7 @@ function mainWorldExtractJid() {
     /^webpackChunk|^__d$|^require$|requireLazy|__webpack|WAWebCmd/i.test(k)
   );
 
-  return { phone, debug };
+  return { phone, pushName, debug };
 }
 
 async function extractPageJid(tabId) {

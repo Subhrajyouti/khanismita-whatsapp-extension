@@ -19,37 +19,45 @@
    * and is explicitly exempt from the page's CSP — it's not subject to script-src at
    * all, unlike a DOM-injected <script> tag.
    *
-   * debug is logged here so we can see, from a REAL main-world execution, whether a
-   * webpack chunk registry exists on this build at all.
+   * Returns { phone, pushName } — pulled from the SAME internal chat/contact object
+   * in one round-trip. pushName is WhatsApp's term for a contact's self-set display
+   * name (shown with a "~" prefix in the Contact Info panel) — it's visible for
+   * saved AND unsaved contacts alike, unlike the phone number which is only shown as
+   * text for unsaved ones.
+   *
+   * debug is logged here so we can see, from a REAL main-world execution, exactly
+   * what was matched.
    */
-  async function getPhoneFromInternalStore() {
+  async function getContactInfoFromInternalStore() {
     try {
       const res = await send("EXTRACT_PAGE_JID");
       if (!res?.ok) {
         console.warn("[KR] EXTRACT_PAGE_JID failed:", res?.error);
-        return "";
+        return { phone: "", pushName: "" };
       }
-      const { phone, debug } = res.data || {};
-      console.log("[KR] MAIN-world extraction debug:", debug);
-      return phone || "";
+      const { phone, pushName, debug } = res.data || {};
+      console.log("[KR] MAIN-world extraction debug (JSON):\n" + JSON.stringify(debug, null, 2));
+      return { phone: phone || "", pushName: pushName || "" };
     } catch (e) {
       console.warn("[KR] EXTRACT_PAGE_JID threw:", e);
-      return "";
+      return { phone: "", pushName: "" };
     }
   }
 
   /**
-   * extractChat() calls getPhoneFromInternalStore() once. On a freshly-opened chat
-   * #main may still be re-rendering when we inject, so give it one retry after a
-   * short delay before falling through to DOM heuristics.
+   * extractChat() calls this once. On a freshly-opened chat #main may still be
+   * re-rendering when we inject, so retry once after a short delay for whichever
+   * field (phone and/or pushName) is still missing, then merge the best of both
+   * attempts rather than discarding a partial first result.
    */
-  async function getPhoneFromInternalStoreWithRetry() {
-    let phone = await getPhoneFromInternalStore();
-    if (!phone) {
+  async function getContactInfoWithRetry() {
+    let result = await getContactInfoFromInternalStore();
+    if (!result.phone || !result.pushName) {
       await new Promise((r) => setTimeout(r, 350));
-      phone = await getPhoneFromInternalStore();
+      const second = await getContactInfoFromInternalStore();
+      result = { phone: result.phone || second.phone, pushName: result.pushName || second.pushName };
     }
-    return phone;
+    return result;
   }
 
   /* ---------------- Helper Utilities ---------------- */
@@ -234,19 +242,34 @@
     //    and works regardless of saved/unsaved contact status. This is the primary,
     //    reliable path (see inspectDOMForContact for why).
     const domContact = inspectDOMForContact();
-    const title = domContact.name || main.querySelector("header span[title]")?.getAttribute("title") || "";
+    let title = domContact.name || main.querySelector("header span[title]")?.getAttribute("title") || "";
     let detectedPhone = domContact.phone;
     let isLid = domContact.isLid;
 
-    // 2. Only fall back to page-context injection (webpack/fiber internals) if the
-    //    DOM scan found nothing AND it wasn't because of an @lid privacy id — in the
-    //    @lid case the number genuinely isn't present client-side and injection
-    //    won't find it either, so skip the extra work and 600ms timeout.
-    if (!detectedPhone && !isLid) {
-      console.log("[KR] DOM scan empty, trying page-context injection…");
-      detectedPhone = await getPhoneFromInternalStoreWithRetry();
-      if (detectedPhone) console.log("[KR] phone found via page-context injection:", detectedPhone);
-      else console.warn("[KR] page-context injection also found nothing for this chat.");
+    // For an UNSAVED contact, WhatsApp shows the phone number itself as the header
+    // "name" — that's not a real name, it's just the identity WhatsApp had to show.
+    // In that case (or when there's no title at all), go fetch WhatsApp's own
+    // self-set display name ("pushname", the "~Seema" shown in Contact Info) from
+    // the internal chat/contact object, same place the phone comes from.
+    const titleIsJustAPhoneNumber = !title || /^\+?[\d\s-]{8,}$/.test(title.trim());
+    console.log("[KR] raw title:", JSON.stringify(title), "| titleIsJustAPhoneNumber:", titleIsJustAPhoneNumber);
+
+    // 2. Fall back to page-context injection (webpack/fiber internals) whenever the
+    //    DOM scan didn't give us a real phone (and it's not an @lid privacy case,
+    //    where the number genuinely isn't recoverable at all), OR when we still
+    //    don't have a real display name for an unsaved contact.
+    if ((!detectedPhone && !isLid) || titleIsJustAPhoneNumber) {
+      console.log("[KR] Fetching from page-context (phone and/or pushname needed)…");
+      const info = await getContactInfoWithRetry();
+      if (!detectedPhone && info.phone) {
+        detectedPhone = info.phone;
+        console.log("[KR] phone found via page-context injection:", detectedPhone);
+      }
+      if (titleIsJustAPhoneNumber && info.pushName) {
+        console.log("[KR] pushname found via page-context injection:", info.pushName);
+        title = info.pushName;
+      }
+      if (!detectedPhone && !info.phone) console.warn("[KR] page-context injection found no phone for this chat.");
     }
 
     if (!detectedPhone) detectedPhone = extractPhoneFromText(title);
