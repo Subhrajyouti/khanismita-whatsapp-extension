@@ -47,8 +47,19 @@
 .kr-checkbox-row input { accent-color: #964B24; width: 16px; height: 16px; }
 
 /* Items list */
-.kr-item-row { display: grid; grid-template-columns: 1fr 64px 80px 32px; gap: 8px; margin-bottom: 8px; align-items: center; }
+.kr-item-row-wrap { margin-bottom: 8px; }
+.kr-item-row { display: grid; grid-template-columns: 1fr 64px 80px 32px; gap: 8px; align-items: center; }
 .kr-del-btn { background: #FEE2E2; color: #EF4444; border: 0; border-radius: 8px; height: 38px; cursor: pointer; font-weight: bold; }
+
+/* Items needing a menu match — unresolved or below-confidence auto-matches */
+.kr-item-row-wrap.kr-item-review {
+  border: 1px solid #F59E0B; background: #FFFBEB; border-radius: 10px;
+  padding: 8px; margin-bottom: 10px;
+}
+.kr-item-row-wrap.kr-item-review .kr-item-row { margin-bottom: 6px; }
+.kr-review-flag { font-size: 12px; font-weight: 600; color: #B45309; margin-bottom: 6px; }
+.kr-candidate-select { margin-top: 2px; }
+.kr-review-count { font-size: 12px; font-weight: 600; color: #B45309; margin: -6px 0 10px; }
 
 .kr-add-btn {
   background: #F2ECE4; color: #78716C; border: 1px dashed #D6CEC4;

@@ -1,4 +1,4 @@
-// WhatsApp Web content script: floating button -> extract chat -> Gemini -> editable order panel.
+// WhatsApp Web content script: floating button -> extract chat -> pending kitchen draft.
 
 (function () {
   if (document.getElementById("kr-fab")) return;
@@ -377,6 +377,164 @@
     return null;
   }
 
+  function showStatus(message, kind = "loading") {
+    document.getElementById("kr-status")?.remove();
+    const el = document.createElement("div");
+    el.id = "kr-status";
+    el.textContent = message;
+    el.style.cssText = [
+      "position:fixed",
+      "right:24px",
+      "bottom:88px",
+      "z-index:2147483000",
+      "max-width:320px",
+      "padding:11px 14px",
+      "border-radius:10px",
+      "font:600 13px system-ui,sans-serif",
+      "color:#fff",
+      `background:${kind === "error" ? "#b91c1c" : kind === "success" ? "#15803d" : "#44403c"}`,
+      "box-shadow:0 4px 14px rgba(0,0,0,.25)",
+    ].join(";");
+    document.body.appendChild(el);
+    return el;
+  }
+
+  /* ---------------- Local item matching (menu never leaves the device) ----------------
+   *
+   * Gemini only ever sees the transcript and returns raw_name/quantity/size per item —
+   * no prices, no menu. Matching those raw names back to real menu rows (and pricing
+   * them) happens entirely here, against the cached menu snapshot from background.js.
+   */
+
+  const FILLER_WORDS = new Set([
+    "plate", "plates", "pc", "pcs", "nos", "no", "full", "piece", "pieces",
+    "qty", "order", "x", "the", "a", "an", "of",
+  ]);
+
+  function normalizeItemName(s) {
+    return String(s || "")
+      .toLowerCase()
+      .normalize("NFKD")
+      .replace(/[^\p{L}\p{N}\s]/gu, " ")
+      .split(/\s+/)
+      .filter((w) => w && !FILLER_WORDS.has(w))
+      .join(" ")
+      .trim();
+  }
+
+  function bigrams(str) {
+    const s = str.replace(/\s+/g, "");
+    const out = [];
+    for (let i = 0; i < s.length - 1; i++) out.push(s.slice(i, i + 2));
+    return out;
+  }
+
+  // Dice coefficient over character bigrams — tolerant of typos/spacing differences
+  // ("chiken curry" vs "chicken curry") in a way plain string equality isn't.
+  function diceCoefficient(a, b) {
+    if (!a && !b) return 1;
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    const ga = bigrams(a), gb = bigrams(b);
+    if (!ga.length || !gb.length) return 0;
+    const counts = new Map();
+    for (const g of ga) counts.set(g, (counts.get(g) || 0) + 1);
+    let matches = 0;
+    for (const g of gb) {
+      const c = counts.get(g) || 0;
+      if (c > 0) { matches++; counts.set(g, c - 1); }
+    }
+    return (2 * matches) / (ga.length + gb.length);
+  }
+
+  // Word-level Jaccard overlap — catches cases like "veg fried rice" vs "fried rice veg"
+  // where bigram similarity alone would be penalized by word order.
+  function tokenOverlap(a, b) {
+    const ta = new Set(a.split(" ").filter(Boolean));
+    const tb = new Set(b.split(" ").filter(Boolean));
+    if (!ta.size || !tb.size) return 0;
+    let inter = 0;
+    for (const t of ta) if (tb.has(t)) inter++;
+    const union = ta.size + tb.size - inter;
+    return union ? inter / union : 0;
+  }
+
+  // Price comes ONLY from the matched menu row — never from Gemini.
+  function priceForMenuRow(row, isHalf) {
+    if (!row) return 0;
+    const p = isHalf
+      ? row.effective_half_price ?? Math.round((Number(row.effective_price) || 0) / 2)
+      : row.effective_price;
+    return Number(p) || 0;
+  }
+
+  function saveAlias(normalized, menuItemId) {
+    if (!normalized || menuItemId == null) return;
+    chrome.storage.local.get({ aliases: {} }, (res) => {
+      const aliases = res.aliases || {};
+      aliases[normalized] = menuItemId;
+      chrome.storage.local.set({ aliases });
+    });
+  }
+
+  /**
+   * Resolves Gemini's {raw_name, quantity, size} items against the cached menu.
+   * 1. Exact alias hit (a name the user has manually matched before) short-circuits
+   *    to a confident (score 1) match.
+   * 2. Otherwise score every menu row via 0.6*Dice-bigram + 0.4*token-overlap.
+   * ≥0.72 = confident, 0.45–0.72 = needs review, below = unmatched (unit_price 0).
+   */
+  function resolveItems(parsedItems, menu, aliases) {
+    aliases = aliases || {};
+    const menuNorm = (menu || []).map((m) => ({ row: m, norm: normalizeItemName(m.name) }));
+
+    return (parsedItems || []).map((it) => {
+      const rawName = it.raw_name || it.item_name || "";
+      const norm = normalizeItemName(rawName);
+      const isHalf = String(it.size || "").toLowerCase() === "half";
+      const quantity = Number(it.quantity) || 1;
+
+      const scored = menuNorm
+        .map(({ row, norm: mnorm }) => ({
+          row,
+          score: 0.6 * diceCoefficient(norm, mnorm) + 0.4 * tokenOverlap(norm, mnorm),
+        }))
+        .sort((a, b) => b.score - a.score);
+
+      const candidates = scored.slice(0, 3).map((c) => ({
+        menu_item_id: c.row.id,
+        item_name: c.row.name,
+        score: Math.round(c.score * 100) / 100,
+        unit_price: priceForMenuRow(c.row, isHalf),
+      }));
+
+      let bestRow = scored[0]?.row || null;
+      let matchScore = scored[0]?.score || 0;
+
+      const aliasId = aliases[norm];
+      if (aliasId != null) {
+        const aliasRow = (menu || []).find((m) => String(m.id) === String(aliasId));
+        if (aliasRow) { bestRow = aliasRow; matchScore = 1; }
+      }
+
+      const status = matchScore >= 0.72 ? "confident" : matchScore >= 0.45 ? "review" : "unmatched";
+      const matched = status !== "unmatched" ? bestRow : null;
+
+      return {
+        menu_item_id: matched ? matched.id : null,
+        item_name: matched ? (isHalf ? `${matched.name} (Half)` : matched.name) : rawName,
+        quantity,
+        unit_price: matched ? priceForMenuRow(matched, isHalf) : 0,
+        matchScore: Math.round(matchScore * 100) / 100,
+        status,
+        raw_name: rawName,
+        is_half: isHalf,
+        candidates,
+        normalized: norm,
+      };
+    });
+  }
+
   /* ---------------- UI ---------------- */
 
   const fab = document.createElement("button");
@@ -467,6 +625,8 @@
     }
   });
 
+  // { menu, menuVersion, fetchedAt } — refreshed (cheaply, via background's own
+  // TTL/version-check) on every open, so a stale in-memory copy never lingers.
   let menuCache = null;
 
   fab.addEventListener("click", async (e) => {
@@ -485,34 +645,82 @@
       return;
     }
 
-    openPanel({ loading: true });
+    const status = showStatus("Reading chat with Gemini…");
 
     try {
-      if (!menuCache) {
-        const m = await send("GET_MENU");
-        if (!m?.ok) throw new Error(m?.error || "Menu fetch failed");
-        menuCache = m.data;
-      }
+      const m = await send("GET_MENU");
+      if (!m?.ok) throw new Error(m?.error || "Menu fetch failed");
+      menuCache = m.data;
 
-      const p = await send("PARSE_CHAT", { transcript: chat.transcript, menu: menuCache });
+      // Gemini only ever sees the transcript — no menu, no prices.
+      const p = await send("PARSE_CHAT", { transcript: chat.transcript });
       if (!p?.ok) throw new Error(p?.error || "AI parse failed");
 
-      const draft = p.data || {};
+      const parsed = p.data || {};
+      const aliasesRes = await new Promise((res) => chrome.storage.local.get({ aliases: {} }, res));
+      const resolvedItems = resolveItems(parsed.items || [], menuCache?.menu || [], aliasesRes.aliases || {});
+
+      const draft = { ...parsed, items: resolvedItems };
       draft.customer_phone = draft.customer_phone || chat.detectedPhone || "";
       draft.customer_name = draft.customer_name || (/\d/.test(chat.title) ? "" : chat.title);
 
-      let parsed = parseCoords(draft.location_text);
-      if (!parsed && draft.location_lat && draft.location_lng) {
-        parsed = { lat: draft.location_lat, lng: draft.location_lng };
+      let parsedLoc = parseCoords(draft.location_text);
+      if (!parsedLoc && draft.location_lat && draft.location_lng) {
+        parsedLoc = { lat: draft.location_lat, lng: draft.location_lng };
       }
 
-      if (parsed) {
-        draft.location_text = `${parsed.lat}, ${parsed.lng}`;
+      if (parsedLoc) {
+        draft.location_text = `${parsedLoc.lat}, ${parsedLoc.lng}`;
       }
 
-      openPanel({ draft, meta: chat });
+      const phone = String(draft.customer_phone || "").replace(/\D/g, "").slice(-10);
+      if (phone.length !== 10) {
+        throw new Error("Could not find a valid 10-digit customer phone number in this chat.");
+      }
+      if (!resolvedItems.length) {
+        throw new Error("No order items were found in the latest customer messages.");
+      }
+
+      const address = parsedLoc
+        ? (draft.rider_notes || null)
+        : (draft.location_text || draft.rider_notes || null);
+      const subtotal = resolvedItems.reduce(
+        (sum, item) => sum + (Number(item.quantity) || 0) * (Number(item.unit_price) || 0),
+        0
+      );
+      const deliveryFee = Number(draft.delivery_fee) || 0;
+
+      status.textContent = "Sending order to Kitchen Orders…";
+      const created = await send("CREATE_ORDER", {
+        customer_name: draft.customer_name || (chat.title && !/^\+?[\d\s-]{8,}$/.test(chat.title) ? chat.title : "WhatsApp Customer"),
+        customer_phone: phone,
+        call_number: draft.call_number || null,
+        address,
+        location_lat: parsedLoc?.lat ?? null,
+        location_lng: parsedLoc?.lng ?? null,
+        notes: draft.notes || null,
+        rider_notes: draft.rider_notes || null,
+        delivery_fee: deliveryFee,
+        total_amount: subtotal + deliveryFee,
+        status: "pending",
+        source: "whatsapp",
+        items: resolvedItems.map((item) => ({
+          menu_item_id: item.menu_item_id ?? null,
+          item_name: item.item_name || item.raw_name || "",
+          quantity: Number(item.quantity) || 1,
+          unit_price: Number(item.unit_price) || 0,
+          variant: item.is_half ? "half" : null,
+        })),
+      });
+      if (!created?.ok) throw new Error(created?.error || "Could not send order to Kitchen Orders.");
+
+      status.textContent = "Order sent to Kitchen Orders ✓";
+      status.style.background = "#15803d";
+      setTimeout(() => status.remove(), 2200);
     } catch (e) {
-      openPanel({ error: String(e.message || e) });
+      status.textContent = String(e.message || e);
+      status.style.background = "#b91c1c";
+      setTimeout(() => status.remove(), 5000);
     }
   });
 
@@ -546,9 +754,16 @@
     const hasCallNum = Boolean(d.call_number);
     let orderType = d.order_type || "delivery";
     const items = (d.items || []).map((i) => ({
-      item_name: i.item_name || "",
+      item_name: i.item_name || i.raw_name || "",
       quantity: Number(i.quantity) || 1,
       unit_price: Number(i.unit_price) || 0,
+      raw_name: i.raw_name || i.item_name || "",
+      menu_item_id: i.menu_item_id ?? null,
+      status: i.status || "manual", // "confident" | "review" | "unmatched" | "manual"
+      matchScore: i.matchScore ?? null,
+      candidates: i.candidates || [],
+      normalized: i.normalized || normalizeItemName(i.raw_name || i.item_name || ""),
+      is_half: !!i.is_half,
     }));
 
     panel.innerHTML = `
@@ -600,6 +815,7 @@
 
       <div class="kr-field">
         <label class="kr-label">Items <span>*</span></label>
+        <div id="kr-review-summary"></div>
         <div id="kr-items"></div>
         <button class="kr-add-btn" id="kr-additem">+ Add item</button>
       </div>
@@ -643,38 +859,94 @@
 
     function renderItems() {
       itemsBox.innerHTML = "";
-      items.forEach((it, idx) => {
-        const row = document.createElement("div");
-        row.className = "kr-item-row";
-        row.innerHTML = `
-          <input class="kr-input" value="${esc(it.item_name)}" data-f="item_name" placeholder="Search menu item..." list="kr-menu">
-          <input class="kr-input" type="number" min="1" value="${it.quantity}" data-f="quantity">
-          <input class="kr-input" type="number" min="0" value="${it.unit_price}" data-f="unit_price">
-          <button class="kr-del-btn" title="Remove">✕</button>`;
 
-        row.querySelectorAll("input").forEach((inp) => {
+      const reviewCount = items.filter((i) => i.status === "review" || i.status === "unmatched").length;
+      const summaryEl = panel.querySelector("#kr-review-summary");
+      if (summaryEl) {
+        summaryEl.innerHTML = reviewCount
+          ? `<div class="kr-review-count">⚠ ${reviewCount} item${reviewCount === 1 ? "" : "s"} need${reviewCount === 1 ? "s" : ""} a menu match</div>`
+          : "";
+      }
+
+      items.forEach((it, idx) => {
+        const needsReview = it.status === "review" || it.status === "unmatched";
+        const wrap = document.createElement("div");
+        wrap.className = "kr-item-row-wrap" + (needsReview ? " kr-item-review" : "");
+
+        const candidateOptions = (it.candidates || [])
+          .map(
+            (c) =>
+              `<option value="${esc(String(c.menu_item_id))}">${esc(c.item_name)} — ₹${c.unit_price} · ${Math.round(c.score * 100)}% match</option>`
+          )
+          .join("");
+
+        wrap.innerHTML = `
+          ${needsReview ? `<div class="kr-review-flag">⚠ "${esc(it.raw_name || it.item_name)}" isn't a confident menu match — pick one, or search below:</div>` : ""}
+          <div class="kr-item-row">
+            <input class="kr-input" value="${esc(it.item_name)}" data-f="item_name" placeholder="Search menu item..." list="kr-menu">
+            <input class="kr-input" type="number" min="1" value="${it.quantity}" data-f="quantity">
+            <input class="kr-input" type="number" min="0" value="${it.unit_price}" data-f="unit_price">
+            <button class="kr-del-btn" title="Remove">✕</button>
+          </div>
+          ${needsReview ? `
+            <select class="kr-input kr-candidate-select">
+              <option value="">— pick closest match —</option>
+              ${candidateOptions}
+            </select>` : ""}`;
+
+        wrap.querySelectorAll("input[data-f]").forEach((inp) => {
           inp.addEventListener("input", () => {
             const f = inp.dataset.f;
             items[idx][f] = f === "item_name" ? inp.value : Number(inp.value) || 0;
             if (f === "item_name") {
-              const hit = (menuCache || []).find((m) => m.name.toLowerCase() === inp.value.toLowerCase());
+              // Typing/selecting an exact menu name (via the "kr-menu" datalist, which
+              // covers the full cached menu) resolves the item just like picking from
+              // the candidate <select> does.
+              const hit = (menuCache?.menu || []).find((m) => m.name.toLowerCase() === inp.value.trim().toLowerCase());
               if (hit) {
-                items[idx].unit_price = Number(hit.price) || 0;
-                const unitPriceInput = row.querySelector('[data-f="unit_price"]');
-                if (unitPriceInput) unitPriceInput.value = items[idx].unit_price;
+                const price = priceForMenuRow(hit, items[idx].is_half);
+                items[idx].unit_price = price;
+                items[idx].menu_item_id = hit.id;
+                items[idx].status = "confident";
+                items[idx].matchScore = 1;
+                saveAlias(items[idx].normalized, hit.id);
+                renderItems();
+                calcTotal();
+                const refocused = itemsBox.querySelectorAll(".kr-item-row")[idx]?.querySelector('[data-f="item_name"]');
+                if (refocused) { refocused.focus(); refocused.setSelectionRange(refocused.value.length, refocused.value.length); }
+                return;
               }
             }
             calcTotal();
           });
         });
-        row.querySelector("button").onclick = () => { items.splice(idx, 1); renderItems(); calcTotal(); };
-        itemsBox.appendChild(row);
+
+        const select = wrap.querySelector(".kr-candidate-select");
+        if (select) {
+          select.addEventListener("change", () => {
+            if (!select.value) return;
+            const hit = (menuCache?.menu || []).find((m) => String(m.id) === select.value);
+            if (!hit) return;
+            const price = priceForMenuRow(hit, items[idx].is_half);
+            items[idx].item_name = items[idx].is_half ? `${hit.name} (Half)` : hit.name;
+            items[idx].unit_price = price;
+            items[idx].menu_item_id = hit.id;
+            items[idx].status = "confident";
+            items[idx].matchScore = 1;
+            saveAlias(items[idx].normalized, hit.id);
+            renderItems();
+            calcTotal();
+          });
+        }
+
+        wrap.querySelector(".kr-del-btn").onclick = () => { items.splice(idx, 1); renderItems(); calcTotal(); };
+        itemsBox.appendChild(wrap);
       });
 
       if (!panel.querySelector("#kr-menu")) {
         const dl = document.createElement("datalist");
         dl.id = "kr-menu";
-        (menuCache || []).forEach((m) => {
+        (menuCache?.menu || []).forEach((m) => {
           const o = document.createElement("option");
           o.value = m.name;
           dl.appendChild(o);
@@ -695,7 +967,10 @@
     calcTotal();
 
     panel.querySelector("#kr-additem").onclick = () => {
-      items.push({ item_name: "", quantity: 1, unit_price: 0 });
+      items.push({
+        item_name: "", quantity: 1, unit_price: 0, raw_name: "", menu_item_id: null,
+        status: "manual", matchScore: null, candidates: [], normalized: "", is_half: false,
+      });
       renderItems();
     };
 
@@ -728,7 +1003,9 @@
         delivery_fee_charged: Number(panel.querySelector("#kr-fee").value) || 0,
         total_amount: calcTotal(),
         status: "pending",
-        items,
+        // Match metadata (menu_item_id/status/candidates/…) is UI-only — the
+        // Supabase insert flow is unchanged and only expects these three fields.
+        items: items.map(({ item_name, quantity, unit_price }) => ({ item_name, quantity, unit_price })),
       };
 
       const res = await send("CREATE_ORDER", payload);

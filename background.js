@@ -1,4 +1,4 @@
-// Service worker: Gemini parsing + Supabase writes.
+// Service worker: Gemini parsing + Supabase draft writes.
 
 const DEFAULTS = {
   geminiKey: "",
@@ -30,33 +30,120 @@ async function sb(path, { method = "GET", body, prefer } = {}) {
   return text ? JSON.parse(text) : null;
 }
 
-async function getMenu() {
-  const rows = await sb(
-    "digital_menu?select=id,name,price,half_price,kitchen,category,is_available&is_available=eq.true&order=category.asc,display_order.asc"
-  );
-  return rows;
+/**
+ * ---------------- Menu cache ----------------
+ *
+ * The menu (with prices) is now kept entirely OUT of the Gemini prompt — parseChat
+ * only ever sees the raw conversation text. Matching a transcribed item name back to
+ * a real menu row + price happens locally in content.js (resolveItems), using this
+ * cache. This module is only responsible for keeping that cache fresh cheaply:
+ * check a version hash (cheap) before pulling a full snapshot (less cheap).
+ */
+
+const MENU_CACHE_KEY = "menuCache";
+const MENU_CACHE_TTL_MS = 5 * 60 * 1000;
+const EMPTY_MENU_CACHE = { menu: [], menuVersion: null, fetchedAt: 0 };
+
+function readMenuCache() {
+  return new Promise((res) => chrome.storage.local.get({ [MENU_CACHE_KEY]: EMPTY_MENU_CACHE }, (r) => res(r[MENU_CACHE_KEY])));
+}
+function writeMenuCache(cache) {
+  return new Promise((res) => chrome.storage.local.set({ [MENU_CACHE_KEY]: cache }, res));
+}
+function clearMenuCache() {
+  return new Promise((res) => chrome.storage.local.remove(MENU_CACHE_KEY, res));
 }
 
-async function parseChat({ transcript, menu }) {
+async function sbRpc(fnName) {
+  const c = await cfg();
+  if (!c.supabaseUrl || !c.supabaseKey) throw new Error("Supabase URL / anon key missing in extension settings.");
+  const r = await fetch(`${c.supabaseUrl}/rest/v1/rpc/${fnName}`, {
+    method: "POST",
+    headers: {
+      apikey: c.supabaseKey,
+      Authorization: `Bearer ${c.supabaseKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({}),
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`Supabase RPC ${fnName} ${r.status}: ${text.slice(0, 300)}`);
+  return text ? JSON.parse(text) : null;
+}
+
+// RPC results can come back as a bare scalar ("abc123"), a single-row object
+// ({hash: "abc123"}), or a one-row array wrapping either — handle all three so a
+// harmless PostgREST return-shape difference never breaks the cache.
+function extractHash(result) {
+  if (result == null) return null;
+  if (typeof result === "string" || typeof result === "number") return String(result);
+  if (Array.isArray(result)) {
+    const first = result[0];
+    if (first == null) return null;
+    if (typeof first === "string" || typeof first === "number") return String(first);
+    return first.hash != null ? String(first.hash) : null;
+  }
+  if (typeof result === "object") return result.hash != null ? String(result.hash) : null;
+  return null;
+}
+
+function extractRows(result) {
+  if (Array.isArray(result)) return result;
+  if (result && Array.isArray(result.rows)) return result.rows;
+  return [];
+}
+
+/**
+ * Returns { menu, menuVersion, fetchedAt }.
+ * - Fresh cache (< 5 min old) and not forced: return it as-is.
+ * - Otherwise: cheap version check first. Hash unchanged -> just bump fetchedAt and
+ *   return the existing rows. Hash changed (or no cache yet) -> pull a full snapshot
+ *   and store the new rows against the new hash.
+ */
+async function getMenuCached({ force = false } = {}) {
+  const cache = (await readMenuCache()) || EMPTY_MENU_CACHE;
+  const age = Date.now() - (cache.fetchedAt || 0);
+
+  if (!force && cache.fetchedAt && age < MENU_CACHE_TTL_MS) {
+    return cache;
+  }
+
+  const newVersion = extractHash(await sbRpc("extension_menu_version"));
+
+  if (!force && newVersion && cache.menuVersion && newVersion === cache.menuVersion) {
+    const refreshed = { ...cache, fetchedAt: Date.now() };
+    await writeMenuCache(refreshed);
+    return refreshed;
+  }
+
+  const rows = extractRows(await sbRpc("extension_menu_snapshot"));
+  const fresh = { menu: rows, menuVersion: newVersion, fetchedAt: Date.now() };
+  await writeMenuCache(fresh);
+  return fresh;
+}
+
+async function refreshMenu() {
+  await clearMenuCache();
+  return getMenuCached({ force: true });
+}
+
+async function parseChat({ transcript }) {
   const c = await cfg();
   if (!c.geminiKey) throw new Error("Gemini API key missing in extension settings.");
 
-  const menuList = menu
-    .map((m) => `${m.name} | ₹${m.price}${m.half_price ? ` (half ₹${m.half_price})` : ""}`)
-    .join("\n");
+  const prompt = `You transcribe food delivery orders from a WhatsApp conversation for an Indian restaurant.
 
-  const prompt = `You extract food delivery orders from a WhatsApp conversation for an Indian restaurant.
-
-MENU (name | price):
-${menuList}
+You are NOT given the restaurant's menu or prices. Matching item names to the real menu and pricing happens later, locally, outside this step — your only job is to faithfully transcribe what the customer said.
 
 CONVERSATION (most recent messages, oldest first):
 ${transcript}
 
 Rules:
 - Only use the LATEST order intent in the conversation. Ignore older/completed orders.
-- Match item names to the MENU list as closely as possible and use the MENU price as unit_price.
-- If the customer says "half", use the half price and put "(Half)" in the item name.
+- For every item ordered, copy the item name into raw_name EXACTLY as the customer typed it — do not correct spelling, do not rename it to a "proper" dish name, do not translate it, do not normalize it.
+- size: "half" if the customer said half / half-plate for that item, otherwise "full".
+- quantity: number of that item ordered (default 1 if unstated).
+- NEVER invent, guess, or estimate a price for any item — there is no price field for items; leave pricing out entirely.
 - Extract customer contact details carefully:
   * customer_phone: Primary 10-digit Indian phone number.
   * call_number: Alternate or secondary call phone number if mentioned.
@@ -90,11 +177,11 @@ Respond with JSON only.`;
         items: {
           type: "object",
           properties: {
-            item_name: { type: "string" },
+            raw_name: { type: "string" },
             quantity: { type: "number" },
-            unit_price: { type: "number" },
+            size: { type: "string", enum: ["full", "half"] },
           },
-          required: ["item_name", "quantity", "unit_price"],
+          required: ["raw_name", "quantity", "size"],
         },
       },
     },
@@ -119,16 +206,18 @@ Respond with JSON only.`;
 }
 async function createOrder(order) {
   const { items, ...head } = order;
-  const inserted = await sb("kitchen_orders", {
+  const inserted = await sb("draft_orders", {
     method: "POST",
     body: [head],
     prefer: "return=representation",
   });
-  const row = inserted[0];
+  const row = Array.isArray(inserted) ? inserted[0] : inserted;
+  if (!row?.id) throw new Error("Draft order was not created.");
+
   if (items?.length) {
-    await sb("kitchen_order_items", {
+    await sb("draft_order_items", {
       method: "POST",
-      body: items.map((i) => ({ ...i, order_id: row.id })),
+      body: items.map((i) => ({ ...i, draft_order_id: row.id })),
       prefer: "return=minimal",
     });
   }
@@ -370,7 +459,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     try {
       if (msg.type === "GET_CONFIG") return sendResponse({ ok: true, data: await cfg() });
-      if (msg.type === "GET_MENU") return sendResponse({ ok: true, data: await getMenu() });
+      if (msg.type === "GET_MENU") return sendResponse({ ok: true, data: await getMenuCached() });
+      if (msg.type === "REFRESH_MENU") return sendResponse({ ok: true, data: await refreshMenu() });
+      if (msg.type === "GET_MENU_INFO") return sendResponse({ ok: true, data: (await readMenuCache()) || EMPTY_MENU_CACHE });
       if (msg.type === "PARSE_CHAT") return sendResponse({ ok: true, data: await parseChat(msg.payload) });
       if (msg.type === "CREATE_ORDER") return sendResponse({ ok: true, data: await createOrder(msg.payload) });
       if (msg.type === "EXTRACT_PAGE_JID") return sendResponse({ ok: true, data: await extractPageJid(_sender?.tab?.id) });
